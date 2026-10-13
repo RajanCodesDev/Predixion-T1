@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Collections Inference Service — E2E Console</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1e222b;
+    --border: #2a2f3a;
+    --text: #e6e9ef;
+    --muted: #98a2b3;
+    --accent: #4f8cff;
+    --ok: #2ecc71;
+    --warn: #f5a524;
+    --err: #ff5d5d;
+    --info: #6ea8fe;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  header {
+    position: sticky; top: 0; z-index: 10;
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+    padding: 14px 20px; background: rgba(15,17,21,.92);
+    border-bottom: 1px solid var(--border); backdrop-filter: blur(6px);
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .spacer { flex: 1; }
+  .pills { display: flex; flex-wrap: wrap; gap: 8px; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 5px 10px; border-radius: 999px;
+    border: 1px solid var(--border); background: var(--panel);
+    font-size: 12px; color: var(--muted);
+  }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: 0 0 auto; }
+  .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); }
+  .dot.err { background: var(--err); } .dot.info { background: var(--info); }
+  .pill b { color: var(--text); font-weight: 600; }
+
+  main { padding: 18px 20px 60px; max-width: 1280px; margin: 0 auto; }
+  section { margin-bottom: 22px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 10px; }
+
+  .grid { display: grid; gap: 12px; }
+  .stats { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+  .cards { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  .card, .stat {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 14px;
+  }
+  .stat .label { font-size: 12px; color: var(--muted); }
+  .stat .value { font-size: 24px; font-weight: 650; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .stat .value.ok { color: var(--ok); } .stat .value.err { color: var(--err); }
+  .stat .value.warn { color: var(--warn); }
+
+  label { display: block; font-size: 12px; color: var(--muted); margin: 0 0 4px; }
+  input, select, button, textarea {
+    font: inherit; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; width: 100%;
+  }
+  input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .row { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); margin-bottom: 10px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+  button {
+    cursor: pointer; width: auto; transition: border-color .12s, background .12s;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.danger { background: #3a1d1d; border-color: #6b2b2b; }
+  button.ghost { background: transparent; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+
+  .note { font-size: 12px; color: var(--muted); margin: 8px 0 0; }
+  .banner {
+    display: none; padding: 10px 12px; border-radius: 8px; margin-bottom: 14px;
+    border: 1px solid var(--border); background: var(--panel);
+  }
+  .banner.warn { border-color: #6b5417; background: #241d0d; color: #f3d59b; }
+  .banner.info { border-color: #1d3d6b; background: #0e1a2b; color: #bcd4ff; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  tbody tr:hover { background: var(--panel-2); }
+  .mono { font-family: var(--mono); font-size: 12px; }
+  .muted { color: var(--muted); }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; border: 1px solid var(--border); }
+  .tag.ok { color: var(--ok); border-color: #245c39; }
+  .tag.err { color: var(--err); border-color: #6b2b2b; }
+  .tag.warn { color: var(--warn); border-color: #6b5417; }
+  .tag.info { color: var(--info); border-color: #1d3d6b; }
+  .scroll { max-height: 320px; overflow: auto; }
+  pre { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; overflow: auto; font-family: var(--mono); font-size: 12px; }
+
+  .progress { height: 8px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px; overflow: hidden; margin-top: 10px; }
+  .progress > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .15s; }
+
+  .empty { color: var(--muted); font-size: 13px; padding: 10px 2px; }
+  .dlq-layout { display: grid; gap: 12px; grid-template-columns: 1.4fr 1fr; }
+  @media (max-width: 860px) { .dlq-layout { grid-template-columns: 1fr; } }
+  .check { display: flex; justify-content: space-between; gap: 10px; padding: 6px 0; border-bottom: 1px dashed var(--border); }
+  .check:last-child { border-bottom: 0; }
+  .spinner { width: 13px; height: 13px; border: 2px solid rgba(255,255,255,.25); border-top-color: #fff; border-radius: 50%; display: inline-block; animation: spin .7s linear infinite; vertical-align: -2px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Collections Inference Service — E2E Console</h1>
+  <div class="spacer"></div>
+  <div class="pills">
+    <span class="pill"><span id="pill-api" class="dot"></span> API <b id="pill-api-text">unknown</b></span>
+    <span class="pill"><span id="pill-cb" class="dot"></span> Circuit <b id="pill-cb-text">unknown</b></span>
+    <span class="pill"><span id="pill-mock" class="dot"></span> Mock <b id="pill-mock-text">unknown</b></span>
+    <span class="pill"><span id="pill-mode" class="dot"></span> Test mode <b id="pill-mode-text">unknown</b></span>
+  </div>
+  <button id="btn-health" class="ghost">Run health checks</button>
+</header>
+
+<main>
+  <div id="banner" class="banner"></div>
+
+  <section>
+    <h2>Session statistics <span class="muted" style="text-transform:none;letter-spacing:0">(browser session only)</span></h2>
+    <div class="grid stats">
+      <div class="stat"><div class="label">Total requests</div><div class="value" id="s-total">0</div></div>
+      <div class="stat"><div class="label">Successful</div><div class="value ok" id="s-ok">0</div></div>
+      <div class="stat"><div class="label">Failed</div><div class="value err" id="s-fail">0</div></div>
+      <div class="stat"><div class="label">Retried</div><div class="value warn" id="s-retry">0</div></div>
+      <div class="stat"><div class="label">Dead-lettered</div><div class="value warn" id="s-dlq">0</div></div>
+      <div class="stat"><div class="label">Success rate</div><div class="value" id="s-rate">—</div></div>
+      <div class="stat"><div class="label">Avg latency</div><div class="value" id="s-lat">—</div></div>
+    </div>
+    <p class="note">These counters describe requests executed during this dashboard session. They are not persisted backend metrics and are not pytest results.</p>
+  </section>
+
+  <div class="grid cards">
+    <section class="card">
+      <h2>Single request</h2>
+      <div class="row">
+        <div><label for="q-event">Event ID (UUID — auto-generated if blank)</label><input id="q-event" placeholder="auto-generated UUID v4" /></div>
+        <div><label for="q-campaign">Campaign ID</label><input id="q-campaign" value="CAMP-2026-10-A" /></div>
+      </div>
+      <div class="row">
+        <div><label for="q-bucket">Borrower bucket</label>
+          <select id="q-bucket">
+            <option>0-30 DPD</option><option>31-60 DPD</option><option>61-90 DPD</option><option>90+ DPD</option>
+          </select></div>
+        <div><label for="q-product">Product type</label>
+          <select id="q-product"><option>bnpl</option><option>credit_card</option><option>personal_loan</option></select></div>
+        <div><label for="q-outcome">Outcome</label>
+          <select id="q-outcome"><option>connected</option><option>no_answer</option><option>ptp_taken</option><option>dispute</option><option>failed_downstream</option></select></div>
+        <div><label for="q-duration">Call duration (s)</label><input id="q-duration" type="number" min="0" value="0" /></div>
+      </div>
+      <div class="actions">
+        <button id="btn-single" class="primary">Run single request</button>
+        <button id="btn-single-fail" disabled title="Enable ENABLE_TEST_CONTROLS to use">Run with scenario</button>
+        <select id="q-scenario" style="width:auto"><option>always_succeed</option><option>fail_once_then_succeed</option><option>always_fail</option><option>slow</option></select>
+      </div>
+      <div id="single-result" class="scroll" style="margin-top:10px"></div>
+    </section>
+
+    <section class="card">
+      <h2>Batch</h2>
+      <div class="row">
+        <div><label for="b-size">Batch size (1–100)</label><input id="b-size" type="number" min="1" max="100" value="20" /></div>
+        <div><label for="b-conc">Concurrency (1–20)</label><input id="b-conc" type="number" min="1" max="20" value="5" /></div>
+        <div><label for="b-scenario">Scenario (test mode)</label>
+          <select id="b-scenario"><option value="">default (20% failure)</option><option>always_succeed</option><option>fail_once_then_succeed</option><option>always_fail</option><option>slow</option></select></div>
+      </div>
+      <div class="actions">
+        <button id="btn-batch" class="primary">Run batch</button>
+      </div>
+      <div class="progress"><i id="batch-progress"></i></div>
+      <div id="batch-result" class="scroll" style="margin-top:10px"></div>
+    </section>
+
+    <section class="card">
+      <h2>Failure scenario</h2>
+      <p class="note">Deterministic downstream simulation. Disabled unless the API and mock both run with <span class="mono">ENABLE_TEST_CONTROLS=true</span>.</p>
+      <div class="row">
+        <div><label for="f-scenario">Scenario</label>
+          <select id="f-scenario"><option>always_fail</option><option>fail_once_then_succeed</option><option>slow</option><option>always_succeed</option></select></div>
+        <div><label for="f-count">Requests</label><input id="f-count" type="number" min="1" max="100" value="6" /></div>
+      </div>
+      <div class="actions">
+        <button id="btn-fail" class="danger" disabled>Run failure scenario</button>
+        <button id="btn-circuit" class="ghost" disabled>Reset circuit breaker</button>
+      </div>
+      <div id="fail-result" class="scroll" style="margin-top:10px"></div>
+    </section>
+
+    <section class="card">
+      <h2>Environment checks</h2>
+      <p class="note">Live reachability checks run by this page. These are not pytest results.</p>
+      <div id="checks"></div>
+    </section>
+  </div>
+
+  <section>
+    <h2>Recent events</h2>
+    <div class="card scroll">
+      <table>
+        <thead><tr><th>Time</th><th>Event ID</th><th>HTTP</th><th>Retries</th><th>Latency</th><th>Result</th></tr></thead>
+        <tbody id="events-body"><tr><td colspan="6" class="empty">No requests yet.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Dead-letter queue</h2>
+    <div class="dlq-layout">
+      <div class="card">
+        <div class="actions" style="margin-bottom:10px">
+          <button id="btn-dlq-refresh" class="primary">Refresh DLQ</button>
+          <button id="btn-dlq-replay" class="ghost" disabled>Replay selected</button>
+        </div>
+        <div class="scroll">
+          <table>
+            <thead><tr><th>Event ID</th><th>Status</th><th>Retries</th><th>Reason</th><th>Updated</th></tr></thead>
+            <tbody id="dlq-body"><tr><td colspan="5" class="empty">DLQ not loaded.</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <h2 style="margin-bottom:6px">Selected event</h2>
+        <div id="dlq-detail" class="empty">Select a row to inspect its full payload.</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Session controls</h2>
+    <div class="actions">
+      <button id="btn-reset-stats" class="ghost">Reset test statistics</button>
+      <button id="btn-clear-results" class="ghost">Clear displayed results</button>
+    </div>
+    <p class="note">Both actions affect only this browser session. No backend or DLQ data is deleted.</p>
+  </section>
+</main>
+
+<script>
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+
+  const state = {
+    total: 0, ok: 0, fail: 0, retries: 0, deadLettered: 0,
+    latencies: [], events: [], checks: [], selectedDlq: null,
+  };
+
+  const now = () => new Date().toLocaleTimeString();
+  const uid = () => (crypto.randomUUID ? crypto.randomUUID() : `ui-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+
+  // fetch wrapper: distinguishes network failure from HTTP failure.
+  async function api(path, { method = "GET", body, headers = {} } = {}) {
+    const started = performance.now();
+    try {
+      const res = await fetch(path, {
+        method,
+        headers: body ? { "Content-Type": "application/json", ...headers } : headers,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      const latencyMs = Math.round(performance.now() - started);
+      const text = await res.text();
+      let parsed = null;
+      try { parsed = text ? JSON.parse(text) : null; } catch { parsed = text; }
+      return { networkError: false, ok: res.ok, status: res.status, body: parsed, latencyMs };
+    } catch (err) {
+      return { networkError: true, ok: false, status: null, body: null, latencyMs: Math.round(performance.now() - started), error: String(err) };
+    }
+  }
+
+  function setDot(id, cls) { $(id).className = "dot " + cls; }
+
+  function recordEvent(entry) {
+    state.total += 1;
+    if (entry.kind === "success") state.ok += 1;
+    else state.fail += 1;
+    if (entry.retries > 0) state.retries += 1;
+    if (entry.deadLettered) state.deadLettered += 1;
+    if (typeof entry.latencyMs === "number") state.latencies.push(entry.latencyMs);
+    state.events.unshift(entry);
+    if (state.events.length > 200) state.events.pop();
+    renderStats();
+    renderEvents();
+  }
+
+  function renderStats() {
+    $("s-total").textContent = state.total;
+    $("s-ok").textContent = state.ok;
+    $("s-fail").textContent = state.fail;
+    $("s-retry").textContent = state.retries;
+    $("s-dlq").textContent = state.deadLettered;
+    $("s-rate").textContent = state.total ? Math.round((state.ok / state.total) * 100) + "%" : "—";
+    $("s-lat").textContent = state.latencies.length
+      ? Math.round(state.latencies.reduce((a, b) => a + b, 0) / state.latencies.length) + " ms"
+      : "—";
+  }
+
+  function resultTag(entry) {
+    if (entry.networkError) return '<span class="tag err">network error</span>';
+    if (entry.deadLettered) return '<span class="tag err">dead-lettered</span>';
+    if (entry.status >= 200 && entry.status < 300) return '<span class="tag ok">' + entry.status + "</span>";
+    if (entry.status === 409) return '<span class="tag warn">' + entry.status + "</span>";
+    return '<span class="tag err">' + entry.status + "</span>";
+  }
+
+  function renderEvents() {
+    const body = $("events-body");
+    if (!state.events.length) {
+      body.innerHTML = '<tr><td colspan="6" class="empty">No requests yet.</td></tr>';
+      return;
+    }
+    body.innerHTML = state.events.map((e) => `
+      <tr>
+        <td class="muted">${e.time}</td>
+        <td class="mono">${e.eventId || "—"}</td>
+        <td>${resultTag(e)}</td>
+        <td>${e.retries ?? "—"}</td>
+        <td>${typeof e.latencyMs === "number" ? e.latencyMs + " ms" : "—"}</td>
+        <td class="muted">${e.summary || ""}</td>
+      </tr>`).join("");
+  }
+
+  function summarize(res) {
+    if (res.networkError) return "request failed at the browser/network layer";
+    const d = res.body && res.body.detail;
+    if (d && d.reason) return d.reason;
+    if (res.body && res.body.status) return res.body.status;
+    return res.ok ? "ok" : "http error";
+  }
+
+  async function checkHealth() {
+    const checks = [];
+    const apiHealth = await api("/health");
+    if (apiHealth.networkError) {
+      setDot("pill-api", "err"); $("pill-api-text").textContent = "unreachable";
+      checks.push({ name: "GET /health", pass: false, detail: "network error" });
+    } else {
+      setDot("pill-api", "ok"); $("pill-api-text").textContent = apiHealth.status;
+      const cs = apiHealth.body && apiHealth.body.circuit_state;
+      setDot("pill-cb", cs === "closed" ? "ok" : cs === "half_open" ? "warn" : "err");
+      $("pill-cb-text").textContent = cs || "unknown";
+      checks.push({ name: "GET /health", pass: apiHealth.ok, detail: "circuit=" + cs });
+    }
+
+    const dep = await api("/dependencies");
+    if (dep.networkError) {
+      setDot("pill-mock", "err"); $("pill-mock-text").textContent = "unreachable";
+      checks.push({ name: "GET /dependencies", pass: false, detail: "network error" });
+    } else {
+      const mock = (dep.body && dep.body.mock) || {};
+      const reachable = mock.reachable === true;
+      setDot("pill-mock", reachable ? "ok" : mock.reachable === null ? "info" : "err");
+      $("pill-mock-text").textContent = reachable ? (mock.status || "ok") : mock.reachable === null ? "unknown" : "unreachable";
+      checks.push({ name: "Mock dependency", pass: reachable, detail: reachable ? "reachable" : (mock.error || "not reachable") });
+    }
+
+    const scenarios = await api("/test/scenarios");
+    if (!scenarios.networkError && scenarios.body) {
+      state.testEnabled = !!scenarios.body.enabled;
+      setDot("pill-mode", state.testEnabled ? "warn" : "info");
+      $("pill-mode-text").textContent = state.testEnabled ? "enabled" : "disabled";
+      checks.push({ name: "Test controls", pass: true, detail: state.testEnabled ? "enabled" : "disabled (safe)" });
+    }
+    applyTestMode();
+    state.checks = checks;
+    renderChecks();
+    return checks;
+  }
+
+  function applyTestMode() {
+    const on = !!state.testEnabled;
+    $("btn-fail").disabled = !on;
+    $("btn-circuit").disabled = !on;
+    $("btn-single-fail").disabled = !on;
+    const banner = $("banner");
+    banner.style.display = "block";
+    if (on) {
+      banner.className = "banner warn";
+      banner.innerHTML = "<b>Test mode enabled.</b> Failure simulation and circuit reset are available. Do not enable <span class='mono'>ENABLE_TEST_CONTROLS</span> on a public deployment.";
+    } else {
+      banner.className = "banner info";
+      banner.innerHTML = "Test controls are disabled. Set <span class='mono'>ENABLE_TEST_CONTROLS=true</span> for the api and mock services to enable failure simulation.";
+    }
+  }
+
+  function renderChecks() {
+    const el = $("checks");
+    if (!state.checks.length) { el.innerHTML = '<div class="empty">Run health checks to populate results.</div>'; return; }
+    el.innerHTML = state.checks.map((c) => `
+      <div class="check">
+        <span>${c.pass ? '<span class="tag ok">pass</span>' : '<span class="tag err">fail</span>'} ${c.name}</span>
+        <span class="muted mono">${c.detail || ""}</span>
+      </div>`).join("");
+  }
+
+  function eventPayload(id) {
+    return {
+      event_id: id,
+      campaign_id: $("q-campaign").value || "CAMP-2026-10-A",
+      borrower_bucket: $("q-bucket").value,
+      product_type: $("q-product").value,
+      timestamp: new Date().toISOString(),
+      call_duration_s: Number($("q-duration").value) || 0,
+      outcome: $("q-outcome").value,
+      retry_count: 0,
+    };
+  }
+
+  function scenarioHeaders(scenario) {
+    return scenario && state.testEnabled ? { "X-Test-Scenario": scenario } : {};
+  }
+
+  async function submitOne(id, scenario) {
+    const res = await api("/calls", { method: "POST", body: eventPayload(id), headers: scenarioHeaders(scenario) });
+    const deadLettered = !res.networkError && res.status === 503 && res.body && res.body.detail && res.body.detail.status === "dead_lettered";
+    const retries = res.body && typeof res.body.retry_count === "number" ? res.body.retry_count : null;
+    recordEvent({
+      time: now(), eventId: id, status: res.status, networkError: res.networkError,
+      retries, latencyMs: res.latencyMs, deadLettered,
+      kind: res.ok ? "success" : "failure",
+      summary: summarize(res),
+    });
+    return res;
+  }
+
+  function renderResult(container, res) {
+    if (res.networkError) {
+      $(container).innerHTML = `<span class="tag err">network failure</span><pre>${res.error}</pre>`;
+      return;
+    }
+    const cls = res.ok ? "ok" : "err";
+    $(container).innerHTML =
+      `<div><span class="tag ${cls}">HTTP ${res.status}</span> <span class="muted">${res.latencyMs} ms</span></div>` +
+      `<pre>${escapeHtml(JSON.stringify(res.body, null, 2))}</pre>`;
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  async function runSingle(withScenario) {
+    const id = $("q-event").value.trim() || uid();
+    $("q-event").value = id;
+    $("single-result").innerHTML = '<span class="spinner"></span> running…';
+    const res = await submitOne(id, withScenario ? $("q-scenario").value : null);
+    renderResult("single-result", res);
+  }
+
+  async function runBatch() {
+    const size = Math.max(1, Math.min(100, Number($("b-size").value) || 1));
+    const conc = Math.max(1, Math.min(20, Number($("b-conc").value) || 1));
+    const scenario = $("b-scenario").value || null;
+    if (scenario && !state.testEnabled) {
+      $("batch-result").innerHTML = '<span class="tag warn">scenario ignored</span> test controls are disabled; running default behaviour.';
+    }
+    const ids = Array.from({ length: size }, () => uid());
+    let done = 0, ok = 0, failed = 0;
+    $("batch-progress").style.width = "0%";
+    $("batch-result").innerHTML = `<span class="spinner"></span> running ${size} requests (concurrency ${conc})…`;
+
+    let cursor = 0;
+    const started = performance.now();
+    async function worker() {
+      while (cursor < ids.length) {
+        const i = cursor++;
+        const res = await submitOne(ids[i], scenario);
+        done += 1;
+        if (res.ok) ok += 1; else failed += 1;
+        $("batch-progress").style.width = Math.round((done / size) * 100) + "%";
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(conc, size) }, worker));
+    const elapsed = Math.round(performance.now() - started);
+    $("batch-result").innerHTML =
+      `<div class="actions">` +
+      `<span class="tag ok">${ok} succeeded</span>` +
+      `<span class="tag err">${failed} failed</span>` +
+      `<span class="tag info">${elapsed} ms</span></div>` +
+      `<p class="note">Batch of ${size} with concurrency ${conc}${scenario ? ", scenario " + escapeHtml(scenario) : ""}. Dead-lettered events appear in the DLQ below.</p>`;
+  }
+
+  async function runFailureScenario() {
+    const scenario = $("f-scenario").value;
+    const count = Math.max(1, Math.min(100, Number($("f-count").value) || 1));
+    $("fail-result").innerHTML = '<span class="spinner"></span> running scenario…';
+    const ids = Array.from({ length: count }, () => uid());
+    const outcomes = [];
+    for (const id of ids) {
+      const res = await submitOne(id, scenario);
+      outcomes.push({ id, res });
+    }
+    const rows = outcomes.map(({ id, res }) => {
+      const retries = res.body && typeof res.body.retry_count === "number" ? res.body.retry_count : "—";
+      return `<tr><td class="mono">${id.slice(0, 12)}…</td><td>${resultTag({ status: res.status, networkError: res.networkError, deadLettered: res.status === 503 })}</td><td>${retries}</td><td class="muted">${summarize(res)}</td></tr>`;
+    }).join("");
+    $("fail-result").innerHTML =
+      `<table><thead><tr><th>Event</th><th>HTTP</th><th>Retries</th><th>Reason</th></tr></thead><tbody>${rows}</tbody></table>` +
+      `<p class="note">If the circuit opened, new requests fail fast with reason <span class="mono">circuit_open</span> until the recovery interval elapses.</p>`;
+  }
+
+  function statusTag(status) {
+    const cls = status === "completed" ? "ok" : status === "processing" ? "warn" : "info";
+    return `<span class="tag ${cls}">${status}</span>`;
+  }
+
+  async function refreshDlq() {
+    $("dlq-body").innerHTML = '<tr><td colspan="5" class="empty"><span class="spinner"></span> loading…</td></tr>';
+    const res = await api("/dlq");
+    if (res.networkError) {
+      $("dlq-body").innerHTML = `<tr><td colspan="5" class="empty">Network error: ${escapeHtml(res.error)}</td></tr>`;
+      return;
+    }
+    const items = (res.body && res.body.items) || [];
+    if (!items.length) {
+      $("dlq-body").innerHTML = '<tr><td colspan="5" class="empty">DLQ is empty.</td></tr>';
+      return;
+    }
+    $("dlq-body").innerHTML = items.map((it) => `
+      <tr data-id="${escapeHtml(it.event_id)}" style="cursor:pointer">
+        <td class="mono">${escapeHtml(it.event_id)}</td>
+        <td>${statusTag(it.status)}</td>
+        <td>${it.retry_count}</td>
+        <td class="muted">${escapeHtml(it.failure_reason || "")}</td>
+        <td class="muted">${escapeHtml((it.updated_at || "").replace("T", " ").slice(0, 19))}</td>
+      </tr>`).join("");
+    [...$("dlq-body").querySelectorAll("tr[data-id]")].forEach((tr) => {
+      tr.addEventListener("click", () => selectDlq(tr.dataset.id));
+    });
+  }
+
+  function selectDlq(id) {
+    state.selectedDlq = id;
+    $("btn-dlq-replay").disabled = false;
+    $("dlq-detail").innerHTML = `<div class="mono">${escapeHtml(id)}</div><p class="note">Loading…</p>`;
+    api("/dlq/" + encodeURIComponent(id)).then((res) => {
+      if (res.networkError || !res.ok) {
+        $("dlq-detail").innerHTML = `<p class="note">Could not load event (HTTP ${res.status}).</p>`;
+        return;
+      }
+      const it = res.body;
+      $("dlq-detail").innerHTML =
+        `<div class="mono">${escapeHtml(it.event_id)}</div>` +
+        `<div style="margin:8px 0">${statusTag(it.status)} <span class="tag info">${it.retry_count} retries</span></div>` +
+        `<div class="note">Failure reason</div><pre>${escapeHtml(it.failure_reason || "")}</pre>` +
+        `<div class="note">Payload</div><pre>${escapeHtml(JSON.stringify(it.payload, null, 2))}</pre>`;
+    });
+  }
+
+  async function replaySelected() {
+    if (!state.selectedDlq) return;
+    const id = state.selectedDlq;
+    $("dlq-detail").innerHTML = `<div class="mono">${escapeHtml(id)}</div><p class="note"><span class="spinner"></span> replaying…</p>`;
+    const headers = state.testEnabled ? { "X-Test-Scenario": "always_succeed" } : {};
+    const res = await api("/dlq/" + encodeURIComponent(id) + "/replay", { method: "POST", headers });
+    recordEvent({
+      time: now(), eventId: id, status: res.status, networkError: res.networkError,
+      retries: res.body && res.body.retry_count, latencyMs: res.latencyMs,
+      deadLettered: !res.networkError && res.status === 503,
+      kind: res.ok ? "success" : "failure", summary: "replay: " + summarize(res),
+    });
+    renderResult("single-result", res);
+    refreshDlq();
+    selectDlq(id);
+  }
+
+  async function resetCircuit() {
+    const res = await api("/test/circuit/reset", { method: "POST" });
+    $("fail-result").innerHTML = res.networkError
+      ? `<span class="tag err">network error</span><pre>${escapeHtml(res.error)}</pre>`
+      : `<p class="note">Circuit reset → <b>${escapeHtml((res.body && res.body.circuit_state) || "?")}</b> (HTTP ${res.status})</p>`;
+    await checkHealth();
+  }
+
+  function resetStats() {
+    state.total = state.ok = state.fail = state.retries = state.deadLettered = 0;
+    state.latencies = [];
+    renderStats();
+  }
+
+  function clearResults() {
+    state.events = [];
+    state.checks = [];
+    $("single-result").innerHTML = "";
+    $("batch-result").innerHTML = "";
+    $("fail-result").innerHTML = "";
+    $("batch-progress").style.width = "0%";
+    renderEvents();
+    renderChecks();
+  }
+
+  // wire up
+  $("btn-health").addEventListener("click", checkHealth);
+  $("btn-single").addEventListener("click", () => runSingle(false));
+  $("btn-single-fail").addEventListener("click", () => runSingle(true));
+  $("btn-batch").addEventListener("click", runBatch);
+  $("btn-fail").addEventListener("click", runFailureScenario);
+  $("btn-circuit").addEventListener("click", resetCircuit);
+  $("btn-dlq-refresh").addEventListener("click", refreshDlq);
+  $("btn-dlq-replay").addEventListener("click", replaySelected);
+  $("btn-reset-stats").addEventListener("click", resetStats);
+  $("btn-clear-results").addEventListener("click", clearResults);
+
+  renderStats();
+  renderEvents();
+  renderChecks();
+  checkHealth();
+})();
+</script>
+</body>
+</html>

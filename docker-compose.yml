@@ -1,0 +1,33 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      # Every value is overridable from the shell or a .env file; the literal
+      # after :- is only a fallback default.
+      MOCK_URL: "${MOCK_URL:-http://mock:8001}"
+      DATABASE_PATH: "${DATABASE_PATH:-/data/dlq.sqlite3}"
+      MAX_ATTEMPTS: "${MAX_ATTEMPTS:-3}"
+      BASE_DELAY_SECONDS: "${BASE_DELAY_SECONDS:-0.2}"
+      MAX_DELAY_SECONDS: "${MAX_DELAY_SECONDS:-2}"
+      REQUEST_TIMEOUT_SECONDS: "${REQUEST_TIMEOUT_SECONDS:-3}"
+      CB_FAILURE_THRESHOLD: "${CB_FAILURE_THRESHOLD:-5}"
+      CB_RECOVERY_SECONDS: "${CB_RECOVERY_SECONDS:-10}"
+      ENABLE_TEST_CONTROLS: "${ENABLE_TEST_CONTROLS:-false}"
+    volumes:
+      # Bind the DLQ to the host so the SQLite file is directly accessible.
+      # Override the host directory with DLQ_HOST_DIR if you prefer another path.
+      - ${DLQ_HOST_DIR:-./data}:/data
+    depends_on:
+      - mock
+  mock:
+    build:
+      context: .
+      dockerfile: mock/Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      ENABLE_TEST_CONTROLS: "${ENABLE_TEST_CONTROLS:-false}"

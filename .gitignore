@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Test / coverage output
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+junit.xml
+htmlcov/
+artifacts/
+
+# Local data & databases
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+/data/
+
+# Logs
+*.log
+logs/
+
+# Secrets / local config
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# Build / packaging
+dist/
+build/
+*.zip
