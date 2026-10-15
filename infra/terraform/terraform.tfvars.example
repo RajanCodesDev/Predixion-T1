@@ -1,0 +1,13 @@
+aws_region       = "ap-south-1"
+project_name     = "collections-challenge"
+environment      = "track2"
+api_image_tag    = "track2"
+mock_image_tag   = "track2"
+api_desired_count = 1
+api_min_capacity  = 1
+api_max_capacity  = 5
+mock_desired_count = 1
+# NAT gateways are billable. Keep enabled for private-subnet egress required to pull images.
+enable_nat_gateway = true
+# HTTP avoids a manual ACM/domain prerequisite for the first demo. Do not treat this as production TLS.
+enable_https = false
