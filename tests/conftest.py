@@ -16,6 +16,8 @@ os.environ.setdefault(
 )
 os.environ.setdefault("MOCK_URL", "http://mock.invalid:8001")
 os.environ.setdefault("ENABLE_TEST_CONTROLS", "false")
+# Keep the suite hermetic: CloudWatch publication must be opt-in per test.
+os.environ.setdefault("CLOUDWATCH_METRICS_ENABLED", "false")
 
 import httpx  # noqa: E402
 import pytest  # noqa: E402
@@ -114,6 +116,7 @@ def app_factory(temp_db_path):
         mock_client=None,
         test_controls=False,
         max_attempts=None,
+        metrics=None,
     ):
         app = create_app(
             dlq=dlq if dlq is not None else DeadLetterQueue(temp_db_path),
@@ -121,6 +124,7 @@ def app_factory(temp_db_path):
             mock_client=mock_client,
             enable_test_controls=test_controls,
             max_attempts=max_attempts,
+            metrics=metrics,
         )
         created.append(app)
         return app

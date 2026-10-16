@@ -5,8 +5,8 @@ data "aws_availability_zones" "available" {
 data "aws_caller_identity" "current" {}
 
 locals {
-  name            = var.project_name
-  azs             = slice(data.aws_availability_zones.available.names, 0, 2)
+  name             = var.project_name
+  azs              = slice(data.aws_availability_zones.available.names, 0, 2)
   api_image        = "${aws_ecr_repository.api.repository_url}:${var.api_image_tag}"
   mock_image       = "${aws_ecr_repository.mock.repository_url}:${var.mock_image_tag}"
   metric_namespace = "CollectionsChallenge"
@@ -52,8 +52,8 @@ resource "aws_route_table_association" "public" {
 }
 
 resource "aws_eip" "nat" {
-  count  = var.enable_nat_gateway ? 1 : 0
-  domain = "vpc"
+  count      = var.enable_nat_gateway ? 1 : 0
+  domain     = "vpc"
   depends_on = [aws_internet_gateway.this]
 }
 
@@ -82,14 +82,24 @@ resource "aws_route_table_association" "private" {
   route_table_id = aws_route_table.private[count.index].id
 }
 
+# Gateway endpoints are free. Keeping DynamoDB traffic on the AWS network means
+# the shared DLQ does not depend on NAT (removed in the budget plan) or on the
+# task's public IP.
+resource "aws_vpc_endpoint" "dynamodb" {
+  vpc_id            = aws_vpc.this.id
+  service_name      = "com.amazonaws.${var.aws_region}.dynamodb"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = [aws_route_table.public.id]
+}
+
 resource "aws_security_group" "alb" {
   name        = "${local.name}-alb"
   description = "Public ALB ingress"
   vpc_id      = aws_vpc.this.id
   ingress {
-    from_port = var.enable_https ? 443 : 80
-    to_port   = var.enable_https ? 443 : 80
-    protocol  = "tcp"
+    from_port   = var.enable_https ? 443 : 80
+    to_port     = var.enable_https ? 443 : 80
+    protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
   egress {
@@ -158,7 +168,7 @@ resource "aws_cloudwatch_log_group" "mock" {
 resource "aws_iam_role" "task_execution" {
   name = "${local.name}-task-execution"
   assume_role_policy = jsonencode({
-    Version = "2012-10-17",
+    Version   = "2012-10-17",
     Statement = [{ Effect = "Allow", Principal = { Service = "ecs-tasks.amazonaws.com" }, Action = "sts:AssumeRole" }]
   })
 }
@@ -170,7 +180,7 @@ resource "aws_iam_role_policy_attachment" "execution_managed" {
 resource "aws_iam_role" "api_task" {
   name = "${local.name}-api-task"
   assume_role_policy = jsonencode({
-    Version = "2012-10-17",
+    Version   = "2012-10-17",
     Statement = [{ Effect = "Allow", Principal = { Service = "ecs-tasks.amazonaws.com" }, Action = "sts:AssumeRole" }]
   })
 }
@@ -180,9 +190,9 @@ resource "aws_iam_role_policy" "api_metrics" {
   policy = jsonencode({
     Version = "2012-10-17",
     Statement = [{
-      Effect = "Allow",
-      Action = ["cloudwatch:PutMetricData"],
-      Resource = "*",
+      Effect    = "Allow",
+      Action    = ["cloudwatch:PutMetricData"],
+      Resource  = "*",
       Condition = { StringEquals = { "cloudwatch:namespace" = local.metric_namespace } }
     }]
   })
@@ -206,8 +216,8 @@ resource "aws_iam_role_policy" "api_dlq" {
   policy = jsonencode({
     Version = "2012-10-17",
     Statement = [{
-      Effect = "Allow",
-      Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Scan"],
+      Effect   = "Allow",
+      Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Scan"],
       Resource = aws_dynamodb_table.dlq.arn
     }]
   })
@@ -217,7 +227,7 @@ resource "aws_ecs_cluster" "this" {
   name = local.name
   setting {
     name  = "containerInsights"
-    value = "enabled"
+    value = var.enable_container_insights ? "enabled" : "disabled"
   }
 }
 
@@ -283,15 +293,19 @@ resource "aws_ecs_task_definition" "mock" {
   cpu                      = var.mock_cpu
   memory                   = var.mock_memory
   execution_role_arn       = aws_iam_role.task_execution.arn
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = var.cpu_architecture
+  }
   container_definitions = jsonencode([{
-    name      = "mock"
-    image     = local.mock_image
-    essential = true
+    name         = "mock"
+    image        = local.mock_image
+    essential    = true
     portMappings = [{ containerPort = 8001, protocol = "tcp" }]
-    environment = [{ name = "ENABLE_TEST_CONTROLS", value = "false" }]
+    environment  = [{ name = "ENABLE_TEST_CONTROLS", value = "false" }]
     logConfiguration = { logDriver = "awslogs", options = {
-      awslogs-group = aws_cloudwatch_log_group.mock.name
-      awslogs-region = var.aws_region
+      awslogs-group         = aws_cloudwatch_log_group.mock.name
+      awslogs-region        = var.aws_region
       awslogs-stream-prefix = "mock"
     } }
     healthCheck = { command = ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3)\""], interval = 30, timeout = 5, retries = 3, startPeriod = 15 }
@@ -324,9 +338,9 @@ resource "aws_ecs_service" "mock" {
   launch_type     = "FARGATE"
   service_registries { registry_arn = aws_service_discovery_service.mock.arn }
   network_configuration {
-    subnets          = aws_subnet.private[*].id
+    subnets          = aws_subnet.public[*].id
     security_groups  = [aws_security_group.mock.id]
-    assign_public_ip = false
+    assign_public_ip = true
   }
   depends_on = [aws_iam_role_policy_attachment.execution_managed]
 }
@@ -339,10 +353,14 @@ resource "aws_ecs_task_definition" "api" {
   memory                   = var.api_memory
   execution_role_arn       = aws_iam_role.task_execution.arn
   task_role_arn            = aws_iam_role.api_task.arn
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = var.cpu_architecture
+  }
   container_definitions = jsonencode([{
-    name      = "api"
-    image     = local.api_image
-    essential = true
+    name         = "api"
+    image        = local.api_image
+    essential    = true
     portMappings = [{ containerPort = 8000, protocol = "tcp" }]
     environment = [
       { name = "MOCK_URL", value = "http://mock.${local.name}.local:8001" },
@@ -357,8 +375,8 @@ resource "aws_ecs_task_definition" "api" {
       { name = "ECS_SERVICE_NAME", value = "api" }
     ]
     logConfiguration = { logDriver = "awslogs", options = {
-      awslogs-group = aws_cloudwatch_log_group.api.name
-      awslogs-region = var.aws_region
+      awslogs-group         = aws_cloudwatch_log_group.api.name
+      awslogs-region        = var.aws_region
       awslogs-stream-prefix = "api"
     } }
     healthCheck = { command = ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)\""], interval = 30, timeout = 5, retries = 3, startPeriod = 20 }
@@ -377,9 +395,9 @@ resource "aws_ecs_service" "api" {
     rollback = true
   }
   network_configuration {
-    subnets          = aws_subnet.private[*].id
+    subnets          = aws_subnet.public[*].id
     security_groups  = [aws_security_group.api.id]
-    assign_public_ip = false
+    assign_public_ip = true
   }
   load_balancer {
     target_group_arn = aws_lb_target_group.api.arn
@@ -428,11 +446,11 @@ resource "aws_cloudwatch_dashboard" "this" {
   dashboard_name = "${local.name}-overview"
   dashboard_body = jsonencode({ widgets = [
     { type = "metric", x = 0, y = 0, width = 12, height = 6, properties = {
-      title = "API in-flight requests per task", view = "timeSeries", region = var.aws_region, stat = "Average", period = 60,
+      title   = "API in-flight requests per task", view = "timeSeries", region = var.aws_region, stat = "Average", period = 60,
       metrics = [[local.metric_namespace, "InFlightRequestsPerTask", "ClusterName", aws_ecs_cluster.this.name, "ServiceName", aws_ecs_service.api.name]]
     } },
     { type = "metric", x = 12, y = 0, width = 12, height = 6, properties = {
-      title = "ALB request count", view = "timeSeries", region = var.aws_region, stat = "Sum", period = 60,
+      title   = "ALB request count", view = "timeSeries", region = var.aws_region, stat = "Sum", period = 60,
       metrics = [["AWS/ApplicationELB", "RequestCount", "LoadBalancer", aws_lb.this.arn_suffix]]
     } },
     { type = "metric", x = 0, y = 6, width = 12, height = 6, properties = {
@@ -450,8 +468,8 @@ resource "aws_cloudwatch_dashboard" "this" {
       ]
     } },
     { type = "metric", x = 0, y = 12, width = 24, height = 6, properties = {
-      title = "ECS desired and running tasks (scaling evidence)", view = "timeSeries", region = var.aws_region, stat = "Average", period = 60,
-      metrics = [["ECS/ContainerInsights", "DesiredTaskCount", "ClusterName", aws_ecs_cluster.this.name, "ServiceName", aws_ecs_service.api.name], ["ECS/ContainerInsights", "RunningTaskCount", "ClusterName", aws_ecs_cluster.this.name, "ServiceName", aws_ecs_service.api.name]]
+      title   = "API desired capacity (scaling evidence)", view = "timeSeries", region = var.aws_region, stat = "Average", period = 60,
+      metrics = [["AWS/ApplicationAutoScaling", "DesiredCapacity", "ServiceNamespace", "ecs", "ResourceId", "service/${aws_ecs_cluster.this.name}/${aws_ecs_service.api.name}", "ScalableDimension", "ecs:service:DesiredCount"]]
     } }
   ] })
 }

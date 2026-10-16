@@ -3,8 +3,9 @@ import asyncio
 
 import pytest
 
+from app.dlq import DynamoDBDeadLetterQueue
 from app.resilience import CircuitBreaker, ResilientPipeline
-from tests.helpers import AlwaysFail, ScriptedAdapter
+from tests.helpers import AlwaysFail, FakeDynamoDBClient, ScriptedAdapter
 
 pytestmark = pytest.mark.api
 
@@ -174,4 +175,49 @@ async def test_concurrent_replay_conflicts(app_factory, client_for, dlq):
     assert second.status_code == 409
     assert second.json()["detail"] == "event_already_processing"
     assert dlq.get("e1")["status"] == "completed"
+
+
+def _dynamodb_dlq():
+    fake = FakeDynamoDBClient()
+    return DynamoDBDeadLetterQueue("test-dlq", client=fake), fake
+
+
+async def test_dynamodb_backend_services_endpoints(app_factory, client_for):
+    """The shared DynamoDB backend works end-to-end through the async offload."""
+    dd, _ = _dynamodb_dlq()
+    dd.put("e1", PAYLOAD, "boom", 2)
+    app = app_factory(dlq=dd, resilient=_success_pipeline())
+
+    async with client_for(app) as client:
+        listing = await client.get("/dlq")
+        single = await client.get("/dlq/e1")
+        replay = await client.post("/dlq/e1/replay")
+
+    assert listing.status_code == 200
+    assert [item["event_id"] for item in listing.json()["items"]] == ["e1"]
+    assert single.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json()["status"] == "completed"
+    assert dd.get("e1")["status"] == "completed"
+
+
+async def test_failed_call_dead_letters_to_dynamodb(
+    app_factory, client_for, sample_event
+):
+    """A failed /calls request is persisted to the shared DynamoDB DLQ."""
+    dd, _ = _dynamodb_dlq()
+    payload = sample_event("dd-evt")
+    event_id = payload["event_id"]
+    resilient = ResilientPipeline(
+        AlwaysFail(RuntimeError("down")), CircuitBreaker(), max_attempts=1
+    )
+    app = app_factory(dlq=dd, resilient=resilient, max_attempts=1)
+
+    async with client_for(app) as client:
+        response = await client.post("/calls", json=payload)
+
+    assert response.status_code == 503
+    items = dd.list()
+    assert [item["event_id"] for item in items] == [event_id]
+    assert items[0]["status"] == "pending"
 

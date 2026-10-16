@@ -48,9 +48,10 @@ Terraform configuration is located in `infra/terraform/`.
 
 | Component | Purpose |
 |---|---|
-| VPC and subnets | Isolate public load-balancer resources from private application workloads |
+| VPC and subnets | Public subnets host the ALB and (in the budget plan) the tasks; private subnets exist for the NAT-based variant |
 | Internet gateway | Provides internet connectivity for public subnets |
-| NAT gateway | Allows private resources to initiate outbound connections |
+| NAT gateway | Optional. Disabled by default in the budget plan, where tasks run in public subnets with a public IP and reach ECR/CloudWatch/DynamoDB over the internet gateway |
+| DynamoDB gateway VPC endpoint | Free endpoint that keeps DLQ traffic on the AWS network (no NAT required) |
 | Security groups | Restrict network traffic between components |
 | Application Load Balancer | Provides an HTTP/HTTPS entry point and distributes requests |
 | Amazon ECS / Fargate | Runs containerized API and mock-inference services |
@@ -82,6 +83,38 @@ The intended control loop is:
 5. ECS adjusts the API service's desired task count within the configured minimum and maximum capacity.
 
 Before the demo, verify that the metric publisher emits the exact namespace, metric name, and dimensions expected by the scaling policy. Confirm that the metric is visible in CloudWatch and that the ECS service scales in response to load.
+
+Metric semantics and limitations:
+
+- `InFlightRequestsPerTask` is a per-task gauge of requests currently being served, not a cumulative count or a time-window rate. Each task publishes only its own value with the `ClusterName`/`ServiceName` dimensions; target tracking averages those datapoints to obtain average concurrent requests per task.
+- The gauge is republished (as `0` when idle) on every publish interval, so target tracking can scale in when traffic stops and stale values age out within one evaluation period.
+- Scaling therefore depends on the application successfully publishing metrics; a missing metric cannot scale the service. Publication is best-effort, never blocks or fails a request, and retains buffered counts/latency until a flush succeeds. See `infra/README.md` for the full set of limitations.
+- If metrics are enabled, both `ECS_CLUSTER_NAME` and `ECS_SERVICE_NAME` are required; the API fails fast at startup when they are missing so it cannot publish a gauge the scaling policy is unable to match.
+- `/health` is excluded from all metrics so ALB and ECS health probes never look like application load.
+
+### Demonstrating scale-out
+
+`InFlightRequestsPerTask` measures **concurrency**, so the target must be met by *concurrent in-flight requests*, not by request rate alone. With the measured mean service time (W ≈ 0.43 s), a target of 5 is ~11.6 requests/second (~700/minute) *per task*. The documented 50 calls/minute profile peaks at only ~0.36 in-flight per task, so it will not (and should not) scale out — a single task is genuinely sufficient. Do not lower the target to force scaling: a sub-1 target on an integer gauge oscillates and is misleading.
+
+To demonstrate scaling, drive sustained concurrency above the target and watch the desired count:
+
+```bash
+# ~30 concurrent in-flight requests for several minutes -> desired climbs toward 5
+BASE_URL="$API_URL" CONCURRENCY=30 TOTAL_EVENTS=30000 python scripts/load_test.py
+```
+
+Expected: target tracking adds tasks until average in-flight ≈ 5 (clamped to `api_max_capacity`). When the load stops, the gauge republishes `0`, and after the 60 s scale-in cooldown plus the conservative target-tracking evaluation the service returns to `api_min_capacity`. Capture evidence from the dashboard's "API desired capacity" widget (Application Auto Scaling `DesiredCapacity`), plus `aws application-autoscaling describe-scaling-activities` for the audit trail.
+
+## Dead-Letter Queue
+
+Failed events are persisted so they can be inspected (`GET /dlq`, `GET /dlq/{id}`) and replayed (`POST /dlq/{id}/replay`) with an atomic, exclusive claim.
+
+Two interchangeable backends are selected by `DLQ_BACKEND`:
+
+- `sqlite` (default) — one file per task at `DATABASE_PATH`. Intended for local development, `docker compose` and tests; it needs no AWS access.
+- `dynamodb` — a single shared table named by `DLQ_TABLE_NAME`. **This is what the ECS API task uses** so dead letters survive task replacement and are visible to every task behind the load balancer. The SQLite file is per-task and ephemeral on Fargate, which would make the `/dlq` endpoints non-deterministic once the service scales past one task.
+
+When `DLQ_BACKEND=dynamodb`, `DLQ_TABLE_NAME` is required and the task fails fast without it. The API calls the (synchronous) DLQ through `asyncio.to_thread` so DynamoDB latency never blocks the event loop.
 
 ## Failure Simulation
 
@@ -126,6 +159,8 @@ The challenge traffic profile is:
 | 16:00–24:00 | 10 calls/minute |
 
 **Important:** Confirm the exact ramp and hold timing from the challenge specification before executing the profile. If the demo compresses the schedule, document the compression factor and preserve the relative traffic phases.
+
+This profile is a *rate* profile and, as noted above, intentionally stays within one task. To exercise autoscaling in the same run, add a bounded concurrency burst (for example `CONCURRENCY=30` with a large `TOTAL_EVENTS`) during the peak window, then stop it and observe scale-in.
 
 Measure request volume, latency, errors, task count, scaling response, and approximate infrastructure cost.
 
@@ -188,18 +223,22 @@ Capture evidence for baseline behavior, failure injection, peak traffic, autosca
 
 ## Cost Management
 
-NAT gateways and load balancers can incur charges even when request volume is low. ECS tasks, public IPv4 addresses, logs, and other resources can also contribute to the total.
+NAT gateways and load balancers incur charges even when request volume is low. ECS tasks, public IPv4 addresses, logs, and metrics also contribute.
+
+Two configurations are documented in `COST_WRITEUP.md`:
+
+- **Plan A (private-subnet + NAT):** ALB, NAT gateway, and one API + one mock task on x86. Roughly **$0.13/hour** at `ap-south-1` list prices.
+- **Plan B (budget plan, the default here):** tasks in public subnets with a public IP (no NAT), ARM64 Fargate at 0.25 vCPU / 0.5 GiB, and Container Insights off. Roughly **$0.06/hour** — about half the hourly burn.
 
 To control spending:
 
-- Use the smallest task sizes that meet the demo's needs.
+- The defaults are already the budget plan; keep `enable_nat_gateway=false`, `cpu_architecture="ARM64"` and `enable_container_insights=false` unless you specifically need the other variant.
 - Keep minimum and desired task counts low when idle.
 - Run the demonstration only for the required period.
-- Avoid leaving NAT gateways, ALBs, or running tasks active after testing.
-- Review CloudWatch log retention and resource costs.
-- Check AWS billing after the demo.
+- Tear down promptly — the hourly charges accrue whether or not requests are served.
+- Review CloudWatch log retention and metric counts.
 
-The challenge's target budget is approximately $10–12. Actual cost depends on region, resource lifetime, traffic, and configuration. Confirm current regional pricing and monitor actual spend rather than assuming the target is guaranteed.
+The challenge's target budget is approximately $10–12. At the Plan B burn rate that is roughly 170–200 hours of continuous running; at the Plan A rate it is roughly 75–90 hours. Actual cost depends on region, resource lifetime, traffic, and configuration — confirm current regional pricing and monitor actual spend rather than assuming the target is guaranteed.
 
 ## Teardown
 

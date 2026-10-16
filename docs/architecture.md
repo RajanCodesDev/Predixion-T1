@@ -30,7 +30,7 @@ collections-agent-track1/
 │   ├── models.py             # Pydantic request/response schemas + domain literals
 │   ├── pipeline.py           # Pipeline Protocol + MockPipeline HTTP adapter
 │   ├── resilience.py         # CircuitBreaker + ResilientPipeline (retry/backoff)
-│   ├── dlq.py                # DeadLetterQueue (SQLite persistence)
+│   ├── dlq.py                # DeadLetterQueue (SQLite) + DynamoDB backend + factory
 │   └── main.py               # FastAPI app, routes, wiring, lifespan hooks
 ├── mock/                     # Mock STT/LLM/TTS dependency (separate service)
 │   ├── main.py               # FastAPI mock with 20% failure + lognormal latency
@@ -97,7 +97,9 @@ in `resilience.py`, and all downstream-specific behavior lives in the adapter (`
 | Constant | Env var | Default | Meaning |
 |---|---|---|---|
 | `MOCK_URL` | `MOCK_URL` | `http://mock:8001` | Base URL of downstream pipeline |
-| `DATABASE_PATH` | `DATABASE_PATH` | `/data/dlq.sqlite3` | SQLite file location |
+| `DATABASE_PATH` | `DATABASE_PATH` | `/data/dlq.sqlite3` | SQLite file location (used when `DLQ_BACKEND=sqlite`) |
+| `DLQ_BACKEND` | `DLQ_BACKEND` | `sqlite` | DLQ backend: `sqlite` or `dynamodb` |
+| `DLQ_TABLE_NAME` | `DLQ_TABLE_NAME` | _(none)_ | DynamoDB table; required when `DLQ_BACKEND=dynamodb` |
 | `MAX_ATTEMPTS` | `MAX_ATTEMPTS` | `3` | Total HTTP attempts per logical event |
 | `BASE_DELAY_SECONDS` | `BASE_DELAY_SECONDS` | `0.2` | First backoff delay |
 | `MAX_DELAY_SECONDS` | `MAX_DELAY_SECONDS` | `2` | Backoff ceiling |
@@ -214,7 +216,24 @@ Important design choices:
 
 **Purpose:** durable landing zone for events that exhausted retries or hit an open circuit.
 
-- Uses **SQLite** (`sqlite3`, stdlib) at `DATABASE_PATH`; the table is created on first
+Two interchangeable implementations share one synchronous interface
+(`put`/`list`/`get`/`set_status`/`claim`), chosen by `dlq_from_env()` from
+`DLQ_BACKEND`:
+
+- **`sqlite`** (default) — `DeadLetterQueue`, stdlib `sqlite3` at `DATABASE_PATH`.
+  Used for local development, `docker compose` and the test suite; needs no AWS
+  access.
+- **`dynamodb`** — `DynamoDBDeadLetterQueue`, one shared table named by
+  `DLQ_TABLE_NAME`. Used by the ECS API task so dead letters survive task
+  replacement and are visible to every task behind the load balancer. Selecting
+  it without a table name raises `MissingDlqConfigError` at startup (fail fast).
+
+The methods are synchronous; `app/main.py` invokes them through
+`asyncio.to_thread` so the DynamoDB-backed path never blocks the event loop. The
+SQLite-specific details below also describe the DynamoDB item shape, which
+mirrors the same columns (with `payload` stored as a JSON string).
+
+- The SQLite backend uses **SQLite** (`sqlite3`, stdlib) at `DATABASE_PATH`; the table is created on first
   construction with `CREATE TABLE IF NOT EXISTS`.
 - Schema (`dead_letters`):
 
@@ -237,6 +256,15 @@ Important design choices:
 `_conn()` is a small context manager that yields a connection with `row_factory =
 sqlite3.Row` and a 10s busy timeout, **commits on success, rolls back on error, and always
 closes** — database failures propagate to the caller rather than being silently swallowed.
+It is specific to the SQLite backend.
+
+The DynamoDB backend reproduces the same semantics with single conditional
+`UpdateItem` calls: `put()` uses `if_not_exists(created_at, :c)` to preserve the
+original timestamp on re-dead-lettering, `set_status()` guards with
+`attribute_exists(event_id)` so a missing event is a no-op (not a partial item),
+and `claim()` guards with `attribute_exists(event_id) AND #s <> :processing` so
+concurrent replays across tasks stay exclusive. Its boto3 client is created
+lazily on first use with short connect/read timeouts.
 
 ---
 
