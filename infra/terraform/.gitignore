@@ -4,3 +4,4 @@
 *.tfplan
 crash.log
 crash.*.log
+infra/terraform/terraform.tfvars
