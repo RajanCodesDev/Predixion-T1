@@ -1,0 +1,23 @@
+aws_region       = "ap-south-1"
+project_name     = "collections-challenge"
+environment      = "track2"
+api_image_tag    = "track2"
+mock_image_tag   = "track2"
+api_desired_count = 1
+api_min_capacity  = 1
+api_max_capacity  = 5
+mock_desired_count = 1
+# Budget plan: tasks run in public subnets with a public IP and reach ECR,
+# CloudWatch and DynamoDB over the internet gateway, so the billable NAT
+# gateway (~$41/month) is not created. Set true only if you also move the ECS
+# services back to private subnets.
+enable_nat_gateway = false
+# HTTP avoids a manual ACM/domain prerequisite for the first demo. Do not treat this as production TLS.
+enable_https = false
+# Graviton Fargate is materially cheaper than x86. The images must be built for
+# the matching platform; infra/scripts/build-and-push.sh defaults to linux/arm64.
+cpu_architecture = "ARM64"
+# Container Insights publishes billable custom metrics. Off for the budget demo;
+# the app's target-tracking metric and Application Auto Scaling DesiredCapacity
+# still provide scaling evidence.
+enable_container_insights = false

@@ -1,203 +1,303 @@
-# Collections Agent — Track 1 (Resilience + Dead-Letter + Cost)
+# Track 2 — Production-Style Deployment on AWS ECS Fargate
 
-Local implementation for the **Predixion AI x TalentX AWS FDE Challenge — Round 1
-(Local Track, Open Entry)** — a collections voice-agent inference service that
-calls a mock STT → LLM → TTS dependency, plus the resilience layer, dead-letter
-handling, model-agnostic adapter boundary, Appendix C traffic simulator, and
-Appendix D cost estimates that the track requires.
+## Overview
 
+Track 2 extends the Collections Agent from Track 1 with AWS infrastructure, container orchestration, custom-metric autoscaling, observability, and a repeatable load-testing and teardown workflow.
+
+The goal is to demonstrate how an existing agent service can be deployed and operated using production-oriented cloud infrastructure while keeping application changes minimal.
+
+**Current implementation status:** Terraform configuration has passed `terraform validate`. A successful validation confirms configuration consistency, not successful provisioning or a working end-to-end deployment. AWS deployment, load testing, scaling behavior, and teardown must be demonstrated and recorded separately.
+
+## Architecture
+
+```text
+                         Load Generator
+                               |
+                               v
+                       Application Load Balancer
+                               |
+                      Public Subnets (AZs)
+                               |
+                               v
+                     ECS Fargate API Service
+                     Private Subnets (AZs)
+                         |           |
+                         |           +----> Mock Inference Service
+                         |                  (Service Discovery)
+                         |
+                         +----> DynamoDB DLQ
+                         |
+                         +----> CloudWatch Logs
+                         |
+                         +----> Custom In-Flight Metric
+                                      |
+                                      v
+                           CloudWatch / Auto Scaling
+                                      |
+                                      v
+                           ECS Service Desired Count
+
+Private task egress --> NAT Gateway --> External AWS APIs
 ```
-HTTP client: POST /calls ─▶ ResilientPipeline (retry+backoff+circuit breaker)
-                                │
-                                ▼
-                        Pipeline protocol (swappable)
-                                │
-                                ▼
-              Mock STT/LLM/TTS dependency  ◀── 20% 503 / lognormal latency
-                                │
-              failures ─▶ SQLite DLQ (inspect + replay)
-```
 
-## Highlights
+The diagram describes the intended architecture. Verify each connection against the Terraform configuration and deployed AWS resources before treating it as a live architecture.
 
-| Track 1 requirement | Where |
-| --- | --- |
-| Retries with backoff + circuit breaker around a mocked dependency | `app/resilience.py` |
-| Dead-letter handling: inspectable + replayable persistence | `app/dlq.py`, REST endpoints |
-| Model-agnostic dependency boundary | `app/pipeline.py` (`Pipeline` protocol) |
-| Six nines-ish failure behavior on a 20% downstream failure rate | end-to-end tests |
-| Cost reasoning, two Fargate configurations | [`COST_WRITEUP.md`](COST_WRITEUP.md) |
-| Swapping the mock for open-weight models | [`MODEL_SWAP.md`](MODEL_SWAP.md) |
-| Appendix C traffic-profile simulator | [`scripts/traffic_profile.py`](scripts/traffic_profile.py) |
-| Browser E2E console (optional turnkey demo) | `/ui` (dashboard) |
+## Infrastructure
 
-Detailed docs:
-- **[docs/USAGE.md](docs/USAGE.md)** — every endpoint, failure simulation, config
-  reference, troubleshooting, and full test commands.
-- **[docs/architecture.md](docs/architecture.md)** — module-by-module design.
+Terraform configuration is located in `infra/terraform/`.
 
-## Quick start
+| Component | Purpose |
+|---|---|
+| VPC and subnets | Public subnets host the ALB and (in the budget plan) the tasks; private subnets exist for the NAT-based variant |
+| Internet gateway | Provides internet connectivity for public subnets |
+| NAT gateway | Optional. Disabled by default in the budget plan, where tasks run in public subnets with a public IP and reach ECR/CloudWatch/DynamoDB over the internet gateway |
+| DynamoDB gateway VPC endpoint | Free endpoint that keeps DLQ traffic on the AWS network (no NAT required) |
+| Security groups | Restrict network traffic between components |
+| Application Load Balancer | Provides an HTTP/HTTPS entry point and distributes requests |
+| Amazon ECS / Fargate | Runs containerized API and mock-inference services |
+| Amazon ECR | Stores container images |
+| IAM roles and policies | Grant tasks the permissions required for execution, metrics, and DLQ access |
+| AWS Cloud Map | Provides private service discovery for the mock service |
+| Amazon DynamoDB | Stores dead-letter records |
+| Amazon CloudWatch | Collects logs and exposes the monitoring dashboard |
+| Application Auto Scaling | Adjusts API service capacity using the configured in-flight metric |
 
-Requirements: Docker Engine + Compose plugin. Python 3.12+ is only needed to run
-tests/scripts on the host.
+### Security model
+
+The intended deployment uses private subnets for application tasks and a public-facing ALB. Security groups should allow application traffic only from the ALB and mock-service traffic only from authorized callers.
+
+IAM policies should follow least privilege. Do not place AWS credentials in container images, source code, or committed Terraform variable files.
+
+HTTPS is conditional on supplying a valid ACM certificate ARN and enabling the corresponding Terraform option.
+
+## Custom-Metric Autoscaling
+
+The API service is configured with an Application Auto Scaling policy based on an in-flight request metric.
+
+The intended control loop is:
+
+1. Requests enter through the ALB.
+2. The API processes requests and tracks in-flight work.
+3. The configured metric is published to CloudWatch.
+4. Application Auto Scaling evaluates the metric against its target.
+5. ECS adjusts the API service's desired task count within the configured minimum and maximum capacity.
+
+Before the demo, verify that the metric publisher emits the exact namespace, metric name, and dimensions expected by the scaling policy. Confirm that the metric is visible in CloudWatch and that the ECS service scales in response to load.
+
+Metric semantics and limitations:
+
+- `InFlightRequestsPerTask` is a per-task gauge of requests currently being served, not a cumulative count or a time-window rate. Each task publishes only its own value with the `ClusterName`/`ServiceName` dimensions; target tracking averages those datapoints to obtain average concurrent requests per task.
+- The gauge is republished (as `0` when idle) on every publish interval, so target tracking can scale in when traffic stops and stale values age out within one evaluation period.
+- Scaling therefore depends on the application successfully publishing metrics; a missing metric cannot scale the service. Publication is best-effort, never blocks or fails a request, and retains buffered counts/latency until a flush succeeds. See `infra/README.md` for the full set of limitations.
+- If metrics are enabled, both `ECS_CLUSTER_NAME` and `ECS_SERVICE_NAME` are required; the API fails fast at startup when they are missing so it cannot publish a gauge the scaling policy is unable to match.
+- `/health` is excluded from all metrics so ALB and ECS health probes never look like application load.
+
+### Demonstrating scale-out
+
+`InFlightRequestsPerTask` measures **concurrency**, so the target must be met by *concurrent in-flight requests*, not by request rate alone. With the measured mean service time (W ≈ 0.43 s), a target of 5 is ~11.6 requests/second (~700/minute) *per task*. The documented 50 calls/minute profile peaks at only ~0.36 in-flight per task, so it will not (and should not) scale out — a single task is genuinely sufficient. Do not lower the target to force scaling: a sub-1 target on an integer gauge oscillates and is misleading.
+
+To demonstrate scaling, drive sustained concurrency above the target and watch the desired count:
 
 ```bash
-docker compose up --build
+# ~30 concurrent in-flight requests for several minutes -> desired climbs toward 5
+BASE_URL="$API_URL" CONCURRENCY=30 TOTAL_EVENTS=30000 python scripts/load_test.py
 ```
 
-| URL | Purpose |
-| --- | --- |
-| http://localhost:8000 | API |
-| http://localhost:8000/ui | E2E console (dashboard) |
-| http://localhost:8000/docs | Swagger |
-| http://localhost:8000/health | API health (includes circuit state) |
-| http://localhost:8001/health | Mock dependency health |
+Expected: target tracking adds tasks until average in-flight ≈ 5 (clamped to `api_max_capacity`). When the load stops, the gauge republishes `0`, and after the 60 s scale-in cooldown plus the conservative target-tracking evaluation the service returns to `api_min_capacity`. Capture evidence from the dashboard's "API desired capacity" widget (Application Auto Scaling `DesiredCapacity`), plus `aws application-autoscaling describe-scaling-activities` for the audit trail.
 
-The dashboard's deterministic failure-simulation controls are **disabled by
-default**. For a local demo, start both services with test controls on:
+## Dead-Letter Queue
+
+Failed events are persisted so they can be inspected (`GET /dlq`, `GET /dlq/{id}`) and replayed (`POST /dlq/{id}/replay`) with an atomic, exclusive claim.
+
+Two interchangeable backends are selected by `DLQ_BACKEND`:
+
+- `sqlite` (default) — one file per task at `DATABASE_PATH`. Intended for local development, `docker compose` and tests; it needs no AWS access.
+- `dynamodb` — a single shared table named by `DLQ_TABLE_NAME`. **This is what the ECS API task uses** so dead letters survive task replacement and are visible to every task behind the load balancer. The SQLite file is per-task and ephemeral on Fargate, which would make the `/dlq` endpoints non-deterministic once the service scales past one task.
+
+When `DLQ_BACKEND=dynamodb`, `DLQ_TABLE_NAME` is required and the task fails fast without it. The API calls the (synchronous) DLQ through `asyncio.to_thread` so DynamoDB latency never blocks the event loop.
+
+## Failure Simulation
+
+The mock-inference service can be used to exercise application resilience and error-handling behavior without running a local large language model.
+
+For a failure-injection demo, configure the mock service to simulate a 20% inference failure rate, if supported by the deployed application and mock configuration.
+
+Record:
+- The configured failure rate and how it was applied.
+- Request success and failure counts.
+- Retry and circuit-breaker behavior.
+- Dead-letter queue activity, if applicable.
+- Service health and scaling behavior during the test.
+
+A simulated inference service is a testing substitute, not a live open-weight GPU inference deployment. If the challenge requires live GPU-backed inference, that requirement remains outstanding until an actual model-serving endpoint is integrated and demonstrated.
+
+## Observability
+
+Use the CloudWatch dashboard and service logs to inspect:
+
+- API request behavior and errors.
+- In-flight request metrics.
+- ECS service task count and scaling activity.
+- Container logs.
+- Mock-inference failures.
+- Dead-letter queue behavior.
+
+For the final demonstration, capture dashboard screenshots or exported evidence showing the system before, during, and after load.
+
+## Load-Test Plan
+
+Use the existing load-testing scripts where compatible with the deployed API.
+
+The challenge traffic profile is:
+
+| Period | Traffic |
+|---|---|
+| 00:00–08:00 | 10 calls/minute |
+| 08:00–10:00 | Ramp toward 50 calls/minute over 15 minutes, then hold |
+| 10:00–14:00 | 10 calls/minute |
+| 14:00–16:00 | Ramp and hold at the specified peak |
+| 16:00–24:00 | 10 calls/minute |
+
+**Important:** Confirm the exact ramp and hold timing from the challenge specification before executing the profile. If the demo compresses the schedule, document the compression factor and preserve the relative traffic phases.
+
+This profile is a *rate* profile and, as noted above, intentionally stays within one task. To exercise autoscaling in the same run, add a bounded concurrency burst (for example `CONCURRENCY=30` with a large `TOTAL_EVENTS`) during the peak window, then stop it and observe scale-in.
+
+Measure request volume, latency, errors, task count, scaling response, and approximate infrastructure cost.
+
+## Deployment Workflow
+
+### Prerequisites
+
+- An AWS account with billing configured.
+- AWS CLI installed and authenticated.
+- Terraform installed.
+- Docker installed and running.
+- Appropriate IAM permissions for ECR, ECS, networking, IAM, CloudWatch, DynamoDB, and Application Auto Scaling.
+- A valid ACM certificate if HTTPS is enabled.
+- Reviewed Terraform variables and image build configuration.
+
+### 1. Configure variables
 
 ```bash
-ENABLE_TEST_CONTROLS=true docker compose up --build
+cd infra/terraform
+cp terraform.tfvars.example terraform.tfvars
 ```
 
-> Test controls must stay off on any public/production deployment. See the
-> safety boundary in [docs/USAGE.md](docs/USAGE.md#7-test-only-failure-simulation--safety-boundary).
+Edit `terraform.tfvars` to suit the environment. Review region, image tags, task counts, capacity limits, NAT configuration, HTTPS settings, and certificate ARN.
 
-## Submit a synthetic call
+Never commit secrets or account credentials.
+
+### 2. Validate Terraform
 
 ```bash
-curl -sS -X POST http://localhost:8000/calls \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "event_id":"4b7f3d0e-0a2a-4c1f-8d00-4f6b9a1c2e3d",
-    "campaign_id":"CAMP-2026-10-A",
-    "borrower_bucket":"0-30 DPD",
-    "product_type":"bnpl",
-    "timestamp":"2026-09-01T09:03:12Z",
-    "call_duration_s":0,
-    "outcome":"connected",
-    "retry_count":0
-  }'
+terraform fmt -check -recursive
+terraform init
+terraform validate
+terraform plan
 ```
 
-The body follows **Appendix A** exactly: `event_id` (UUID), `campaign_id`,
-`borrower_bucket`, `timestamp`, `outcome` are **required**; `product_type`,
-`call_duration_s`, `retry_count` are **optional**. Invalid enums, malformed
-UUIDs/timestamps, and negative durations return HTTP 422.
+Review the plan before making changes. Confirm that resource counts, IAM permissions, networking, and estimated costs are acceptable.
 
-On success the API returns:
+### 3. Build and publish images
 
-```json
-{"event_id":"...","outcome":"connected","retry_count":0,"pipeline":{"status":"ok","transcript":"synthetic transcript","response_audio_ref":"synthetic","latency_ms":298}}
-```
+Review `infra/scripts/build-and-push.sh` and ensure the image build contexts and Dockerfiles match the actual repository. Then execute the script according to its documented usage.
 
-The mock follows **Appendix B**: an independent 20% HTTP 503 probability per
-request (injected *before* latency) and lognormal successful latency. The
-configured `MAX_ATTEMPTS=3` means one initial attempt plus up to two retries,
-so the observed final-event failure rate (~1%) is far below the per-request 20%.
+Confirm that both required images exist in ECR before provisioning ECS services that depend on them.
 
-### Measured percentile latency (success path only)
+### 4. Deploy
 
-Method (see `scripts/latency_sample.py`): sample the exact distribution the
-mock uses — `random.lognormvariate(5.7, 0.62)` ms, the challenge's suggested
-`(5.7, 0.35)` retuned so the tail matches the ~700/1200 ms targets — over
-200,000 samples without sleeping:
+Review `infra/scripts/deploy.sh` before running it. Confirm that it uses the intended Terraform directory, variables, image tags, and deployment order.
 
-| Percentile | Target (Appendix B) | Measured (200k samples) |
-| --- | --- | --- |
-| p50 | ≈300 ms | **299 ms** |
-| p90 | ≈700 ms | **663 ms** |
-| p99 | ≈1200 ms | **1278 ms** |
+After deployment, verify:
+- ECS tasks reach a healthy running state.
+- The ALB target group reports healthy targets.
+- API health endpoints respond.
+- The API can reach the mock-inference service.
+- CloudWatch logs and metrics are available.
 
-## Inspect and replay the DLQ
+### 5. Run tests and load
+
+Run the existing tests locally first. Review the load-test script's arguments and rate controls before targeting AWS.
+
+Capture evidence for baseline behavior, failure injection, peak traffic, autoscaling, recovery, and teardown.
+
+## Cost Management
+
+NAT gateways and load balancers incur charges even when request volume is low. ECS tasks, public IPv4 addresses, logs, and metrics also contribute.
+
+Two configurations are documented in `COST_WRITEUP.md`:
+
+- **Plan A (private-subnet + NAT):** ALB, NAT gateway, and one API + one mock task on x86. Roughly **$0.13/hour** at `ap-south-1` list prices.
+- **Plan B (budget plan, the default here):** tasks in public subnets with a public IP (no NAT), ARM64 Fargate at 0.25 vCPU / 0.5 GiB, and Container Insights off. Roughly **$0.06/hour** — about half the hourly burn.
+
+To control spending:
+
+- The defaults are already the budget plan; keep `enable_nat_gateway=false`, `cpu_architecture="ARM64"` and `enable_container_insights=false` unless you specifically need the other variant.
+- Keep minimum and desired task counts low when idle.
+- Run the demonstration only for the required period.
+- Tear down promptly — the hourly charges accrue whether or not requests are served.
+- Review CloudWatch log retention and metric counts.
+
+The challenge's target budget is approximately $10–12. At the Plan B burn rate that is roughly 170–200 hours of continuous running; at the Plan A rate it is roughly 75–90 hours. Actual cost depends on region, resource lifetime, traffic, and configuration — confirm current regional pricing and monitor actual spend rather than assuming the target is guaranteed.
+
+## Teardown
+
+After collecting the required evidence, inspect and run the reviewed teardown script:
 
 ```bash
-curl -sS http://localhost:8000/dlq                       # list all
-curl -sS http://localhost:8000/dlq/<event_id>            # inspect one
-curl -sS -X POST http://localhost:8000/dlq/<event_id>/replay
+# From the repository root
+sed -n '1,240p' infra/scripts/destroy.sh
 ```
 
-- Missing ids → `404 event_not_found`; an event already being replayed → `409
-  event_already_processing` (the claim is atomic, so concurrent replays cannot
-  race).
-- Replay goes through the **same resilient pipeline**. Success → `completed`;
-  failure → back to `pending` with the new failure reason.
-- The SQLite DB is bind-mounted to the host at `./data/dlq.sqlite3`
-  (`DLQ_HOST_DIR` overrides), so events **survive restarts** with the same
-  volume.
-- Duplicate policy: `event_id` is an idempotency key — re-dead-lettering upserts
-  the last payload/reason and resets status to `pending`; a later success does
-  **not** auto-clear the row.
-
-## Traffic profile (Appendix C)
+Run it only after confirming that the selected Terraform workspace and variables refer to the demo environment:
 
 ```bash
-# Full daily schedule, compressed: 1 simulated hour = 1 real minute (~23.4k calls)
-python scripts/traffic_profile.py --base-url http://localhost:8000 --speed 60
-
-# Short demo that still traverses both campaign spikes (1 sim day ≈ 24s, 2% volume)
-python scripts/traffic_profile.py --base-url http://localhost:8000 --demo
+./infra/scripts/destroy.sh
 ```
 
-The runner implements the exact windows (10/min baseline; 08–10 and 14–16 ramps
-10→50 over 15 min then hold; back to 10/min), uses monotonic time, bounded
-concurrency with a capped launch queue (no unbounded buffering), unique UUID
-events, and reports planned vs. actual rates, success/failures, retries,
-latency percentiles, and final DLQ depth. It also supports multi-day runs
-(`--duration-hours 48`) and rate scaling (`--volume-scale`) for laptops.
+Verify in the AWS console that the created ECS services, tasks, ALB, NAT gateway, and other billable resources have been removed. Check for retained ECR images, log groups, public IP allocations, or other resources not covered by the teardown.
 
-> A `--demo` run demonstrates the schedule **shape**; it is explicitly *not* a
-> literal 24-hour load test (see the printed notice and the schedule unit tests).
+Do not delete shared resources that existed before the demo.
 
-## Costs and swapping the mock for real open-weight models
+## Validation and Evidence Checklist
 
-- **[COST_WRITEUP.md](COST_WRITEUP.md)** — two Appendix D Fargate configurations
-  with a recommendation and assumptions.
-- **[MODEL_SWAP.md](MODEL_SWAP.md)** — how to replace the HTTP mock with a real
-  Whisper/LLM/TTS stack without touching the resilience layer.
+- [ ] Terraform formatting and validation pass.
+- [ ] Terraform plan reviewed.
+- [ ] Container images built and pushed to ECR.
+- [ ] ECS services start and pass health checks.
+- [ ] ALB routes requests successfully.
+- [ ] Private API-to-mock communication works.
+- [ ] In-flight metric appears in CloudWatch.
+- [ ] Autoscaling responds to load.
+- [ ] Failure injection and resilience behavior recorded.
+- [ ] Load profile and results documented.
+- [ ] Cost estimate and actual spend recorded.
+- [ ] Teardown completed and residual resources checked.
+- [ ] Live GPU/open-weight inference demonstrated if required by the challenge.
 
-## Configuration and secrets
+## Repository Layout
 
-No secrets, API keys, or credentials are required or stored. Every knob has a
-sane default and an environment override (see
-[docs/USAGE.md](docs/USAGE.md#1-configuration) for the full table). Docker
-Compose uses `${VAR:-default}` interpolation on every setting, so `.env` or
-shell values always take effect.
-
-## Tests
-
-```bash
-python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
-pytest -v                                   # 138 tests
-pytest --cov=app --cov-report=term-missing  # 99% coverage on app/
-pytest --junitxml=artifacts/junit.xml
-pytest -m unit && pytest -m api && pytest -m integration
+```text
+collections-agent-track1/
+├── app/                         # Track 1 application
+├── mock/                        # Existing mock service, if present
+├── tests/                       # Existing application tests
+├── scripts/                     # Existing application/load scripts
+├── infra/
+│   ├── README.md
+│   ├── scripts/
+│   │   ├── build-and-push.sh
+│   │   ├── deploy.sh
+│   │   └── destroy.sh
+│   └── terraform/
+│       ├── main.tf
+│       ├── variables.tf
+│       ├── outputs.tf
+│       ├── versions.tf
+│       └── terraform.tfvars.example
+└── README_TRACK2.md
 ```
 
-Current result (this submission): **138 passed**; coverage **99%** for `app/`
-(`app/resilience.py`, `app/models.py`, `app/pipeline.py` 100%,
-`app/main.py` 99%, `app/dlq.py` 95%) and 100% for `mock/`. CI runs the same
-suite without AWS in `.github/workflows/ci.yml`. Tests never depend on the
-mock's random 20% failure — they use deterministic injected scenarios and
-scripted adapters.
+## Final Status
 
-## Design
-
-`ResilientPipeline` depends on a `Pipeline` protocol, not a model vendor.
-`MockPipeline` is the HTTP adapter; a real open-weight adapter implements the
-same `process(request)` interface while retry/backoff/circuit policy stays in
-the resilience layer. See [docs/architecture.md](docs/architecture.md).
-
-## Known limitations (honest)
-
-- Circuit-breaker state is in-process; a multi-replica deployment needs shared
-  coordination or instance-local semantics.
-- The demo dashboard's session statistics are in-browser only and are explicitly
-  not pytest results.
-- A compressed traffic run validates the rate schedule's shape; true
-  capacity testing needs to account for your hardware/OS as documented.
-- All data is fully synthetic. No AWS account is used; all costs are estimates.
-
-## License
-
-Apache-2.0 (see `LICENSE`).
+This document describes the intended Track 2 deployment and validation procedure. Record actual deployment results, screenshots, metrics, load-test outputs, cost, and teardown evidence before marking the corresponding checklist items complete.

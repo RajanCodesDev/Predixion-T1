@@ -47,3 +47,7 @@ Thumbs.db
 dist/
 build/
 *.zip
+
+
+#Terraform
+infra/terraform/terraform.tfvars

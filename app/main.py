@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -8,17 +9,17 @@ from fastapi.responses import FileResponse, RedirectResponse
 from app.config import (
     MOCK_URL,
     REQUEST_TIMEOUT_SECONDS,
-    DATABASE_PATH,
     MAX_ATTEMPTS,
     MAX_DELAY_SECONDS,
     CB_FAILURE_THRESHOLD,
     CB_RECOVERY_SECONDS,
     ENABLE_TEST_CONTROLS,
 )
+from app.metrics import CloudWatchPublisher, RequestMetricsMiddleware, metrics_from_env
 from app.models import CallEvent, PipelineRequest, TEST_SCENARIOS
 from app.pipeline import MockPipeline
 from app.resilience import ResilientPipeline, CircuitOpenError
-from app.dlq import DeadLetterQueue
+from app.dlq import DeadLetterQueue, DynamoDBDeadLetterQueue, dlq_from_env
 
 STATIC_DIR = Path(__file__).parent / "static"
 UI_HTML = STATIC_DIR / "index.html"
@@ -43,12 +44,13 @@ def describe_exception(exc: Exception) -> str:
 
 def create_app(
     *,
-    dlq: DeadLetterQueue | None = None,
+    dlq: DeadLetterQueue | DynamoDBDeadLetterQueue | None = None,
     resilient: ResilientPipeline | None = None,
     mock_client: httpx.AsyncClient | None = None,
     enable_test_controls: bool | None = None,
     mock_url: str | None = None,
     max_attempts: int | None = None,
+    metrics: CloudWatchPublisher | None = None,
 ) -> FastAPI:
     """Build the API application.
 
@@ -56,12 +58,22 @@ def create_app(
     created during lifespan startup. Tests inject ``dlq``/``resilient`` (and
     optionally ``mock_client``) so behaviour is fully deterministic and no
     real network calls are made.
+
+    ``metrics`` overrides the CloudWatch publisher (tests inject one with a fake
+    client). When omitted it is built from configuration and is ``None`` unless
+    ``CLOUDWATCH_METRICS_ENABLED`` is true; with no publisher the request
+    instrumentation is not installed at all, so the default path is unchanged.
+    Enabling metrics without ``ECS_CLUSTER_NAME``/``ECS_SERVICE_NAME`` raises
+    :class:`~app.metrics.MissingMetricDimensionsError` here, before the app is
+    built, so a misconfigured task fails to start instead of running with
+    autoscaling that can never trigger.
     """
     settings_url = mock_url or MOCK_URL
     attempts = max_attempts or MAX_ATTEMPTS
     test_controls = (
         ENABLE_TEST_CONTROLS if enable_test_controls is None else enable_test_controls
     )
+    metrics_publisher = metrics if metrics is not None else metrics_from_env()
 
     # When only a mock client is injected, wire the real adapter around it now.
     if resilient is None and mock_client is not None:
@@ -82,7 +94,11 @@ def create_app(
                 MockPipeline(created_client),
                 max_attempts=attempts,
             )
+        if app.state.metrics is not None:
+            await app.state.metrics.start()
         yield
+        if app.state.metrics is not None:
+            await app.state.metrics.stop()
         if created_client is not None:
             await created_client.aclose()
 
@@ -93,11 +109,28 @@ def create_app(
     )
 
     # Application state (replaces module globals, keeps handlers testable).
-    app.state.dlq = dlq or DeadLetterQueue(DATABASE_PATH)
+    # ``dlq_from_env`` selects SQLite (default) or the shared DynamoDB backend,
+    # and fails fast if DynamoDB is configured without a table name.
+    app.state.dlq = dlq or dlq_from_env()
     app.state.resilient = resilient
     app.state.mock_client = mock_client
     app.state.enable_test_controls = test_controls
     app.state.max_attempts = attempts
+    app.state.metrics = metrics_publisher
+
+    async def dlq_call(method: str, *args):
+        """Run a (possibly network-backed) DLQ method off the event loop.
+
+        The DLQ interface is synchronous so it can be used and tested directly.
+        DynamoDB calls would otherwise block the event loop, so every handler
+        goes through this helper.
+        """
+        return await asyncio.to_thread(getattr(app.state.dlq, method), *args)
+
+    # Request instrumentation is only installed when metrics are enabled, so a
+    # disabled deployment pays no middleware cost and behaves exactly as before.
+    if metrics_publisher is not None:
+        app.add_middleware(RequestMetricsMiddleware, metrics=metrics_publisher.collector)
 
     def _resolve_scenario(request: Request) -> str | None:
         """Read the test-only scenario header when controls are enabled.
@@ -177,7 +210,8 @@ def create_app(
             }
 
         except CircuitOpenError:
-            app.state.dlq.put(
+            await dlq_call(
+                "put",
                 event_id,
                 event.model_dump(mode="json"),
                 "circuit_open",
@@ -197,7 +231,8 @@ def create_app(
             # The resilience layer records the *actual* number of retries on the
             # raised exception, so this is accurate even when a non-retryable
             # error short-circuits before exhausting attempts.
-            app.state.dlq.put(
+            await dlq_call(
+                "put",
                 event_id,
                 event.model_dump(mode="json"),
                 reason,
@@ -214,18 +249,18 @@ def create_app(
 
     @app.get("/dlq")
     async def list_dlq():
-        return {"items": app.state.dlq.list()}
+        return {"items": await dlq_call("list")}
 
     @app.get("/dlq/{event_id}")
     async def get_dlq_event(event_id: str):
-        item = app.state.dlq.get(event_id)
+        item = await dlq_call("get", event_id)
         if not item:
             raise HTTPException(status_code=404, detail="event_not_found")
         return item
 
     @app.post("/dlq/{event_id}/replay")
     async def replay_event(event_id: str, request: Request):
-        item = app.state.dlq.get(event_id)
+        item = await dlq_call("get", event_id)
         if not item:
             raise HTTPException(status_code=404, detail="event_not_found")
         if item["status"] == "processing":
@@ -234,7 +269,7 @@ def create_app(
         scenario = _resolve_scenario(request)
 
         # Atomically claim the event so concurrent replays cannot both proceed.
-        if not app.state.dlq.claim(event_id):
+        if not await dlq_call("claim", event_id):
             raise HTTPException(status_code=409, detail="event_already_processing")
 
         try:
@@ -245,7 +280,7 @@ def create_app(
                     scenario=scenario,
                 )
             )
-            app.state.dlq.set_status(event_id, "completed")
+            await dlq_call("set_status", event_id, "completed")
             return {
                 "event_id": event_id,
                 "status": "completed",
@@ -259,7 +294,7 @@ def create_app(
                 if isinstance(exc, CircuitOpenError)
                 else describe_exception(exc)
             )
-            app.state.dlq.set_status(event_id, "pending", reason)
+            await dlq_call("set_status", event_id, "pending", reason)
             raise HTTPException(
                 status_code=503,
                 detail={
